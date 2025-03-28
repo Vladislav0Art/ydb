@@ -69,6 +69,7 @@ TString NCsvFormat::TLinesSplitter::ConsumeLine() {
     bool Escape = false;
     TString result;
     TString line;
+
     while (Input.ReadLine(line)) {
         for (auto it = line.begin(); it != line.end(); ++it) {
             if (*it == Quote) {
@@ -76,9 +77,9 @@ TString NCsvFormat::TLinesSplitter::ConsumeLine() {
             }
         }
         if (!result) {
-            result = line;
+            result = std::move(line);
         } else {
-            result += line;
+            result.append(std::move(line));
         }
         if (!Escape) {
             break;
