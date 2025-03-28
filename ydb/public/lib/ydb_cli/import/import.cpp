@@ -325,6 +325,7 @@ private:
     size_t CurrentSemaphoreMax;
     bool Finished = false;
     std::mutex Mutex;
+
     // Jobs starts on launching a worker in a separate thread that builds TValue and sends request
     // Job ends on receiving final request (after all retries)
     std::counting_semaphore<> JobsSemaphore;
@@ -613,7 +614,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
         .ClientTimeout(Settings.ClientTimeout_);
 
     bool isStdoutInteractive = IsStdoutInteractive();
-    size_t filePathsSize = filePaths.size();
+    const size_t filePathsSize = filePaths.size();
     std::mutex progressWriteLock;
     std::atomic<ui64> globalProgress{0};
 
@@ -627,8 +628,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
 
     auto start = TInstant::Now();
 
-
-    TThreadPool jobPool;
+    TThreadPool jobPool(IThreadPool::TParams().SetThreadNamePrefix("FileUpserting"));
     jobPool.Start(filePathsSize);
     TVector<NThreading::TFuture<TStatus>> asyncResults;
 
@@ -648,6 +648,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
     for (size_t fileOrderNumber = 0; fileOrderNumber < filePathsSize; ++fileOrderNumber) {
         const auto& filePath = filePaths[fileOrderNumber];
         std::shared_ptr<TProgressFile> progressFile = LoadOrStartImportProgress(filePath);
+
         auto func = [&, fileOrderNumber, progressFile, this] {
             std::unique_ptr<TFileInput> fileInput;
             std::optional<ui64> fileSizeHint;
