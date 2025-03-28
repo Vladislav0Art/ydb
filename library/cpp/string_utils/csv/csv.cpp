@@ -74,8 +74,9 @@ TString NCsvFormat::TLinesSplitter::ConsumeLine() {
 
     while (Input.ReadLine(line)) {
         const size_t quoteCount = std::count(line.cbegin(), line.cend(), Quote);
-        // TODO: use `& 1`?
-        if (quoteCount % 2 == 1) {
+        // NOTE: equivalent to `quoteCount % 2 == 1`
+        // see whether the number of quotes is odd; if so, we toggle the escape flag
+        if (quoteCount & 1UL) {
             Escape = !Escape;
         }
 
@@ -84,10 +85,11 @@ TString NCsvFormat::TLinesSplitter::ConsumeLine() {
         } else {
             result.append(std::move(line));
         }
+
         if (!Escape) {
             break;
         } else {
-            result += "\n";
+            result.append("\n");
         }
     }
     return result;
