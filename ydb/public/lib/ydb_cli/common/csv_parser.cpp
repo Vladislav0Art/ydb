@@ -565,12 +565,6 @@ TValue TCsvParser::BuildList(const std::vector<TString>& lines, const TString& f
         columnTypeParsers.push_back(std::make_unique<TTypeParser>(*type));
     }
 
-    std::vector<TCsvToYdbConverter> converters;
-    converters.reserve(ResultColumnCount);
-    for (const TType* type : ResultLineTypesSorted) {
-        converters.emplace_back(*type, NullValue);
-    }
-
     const TParseMetadata meta {row, filename};
 
     Ydb::Value listValue;
