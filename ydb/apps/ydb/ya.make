@@ -4,6 +4,10 @@ IF(BUILD_TYPE == RELEASE)
     STRIP()
 ENDIF()
 
+CFLAGS(
+    -fno-omit-frame-pointer
+)
+
 SRCS(
     main.cpp
 )
