@@ -564,17 +564,28 @@ TValue TCsvParser::BuildList(const std::vector<TString>& lines, const TString& f
     for (const TType* type : ResultLineTypesSorted) {
         columnTypeParsers.push_back(std::make_unique<TTypeParser>(*type));
     }
+
+    std::vector<TCsvToYdbConverter> converters;
+    converters.reserve(ResultColumnCount);
+    for (const TType* type : ResultLineTypesSorted) {
+        converters.emplace_back(*type, NullValue);
+    }
+
+    const TParseMetadata meta {row, filename};
+
     Ydb::Value listValue;
     auto* listItems = listValue.mutable_items();
     listItems->Reserve(lines.size());
+
     for (const auto& line : lines) {
         NCsvFormat::CsvSplitter splitter(line, Delimeter);
-        TParseMetadata meta {row, filename};
         auto* structItems = listItems->Add()->mutable_items();
         structItems->Reserve(ResultColumnCount);
+
         auto headerIt = Header.cbegin();
         auto skipIt = SkipBitMap.begin();
         auto typeParserIt = columnTypeParsers.begin();
+
         do {
             if (headerIt == Header.cend()) { // SkipBitMap has same size as Header
                 throw FormatError(yexception() << "Header contains less fields than data. Header: \"" << HeaderRow << "\", data: \"" << line << "\"", meta);
