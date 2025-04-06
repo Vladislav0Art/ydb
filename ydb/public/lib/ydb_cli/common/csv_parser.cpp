@@ -165,7 +165,7 @@ public:
         }
         case EPrimitiveType::Interval64:
             Builder.Interval64(GetArithmetic<i64>(token));
-            break;            
+            break;
         case EPrimitiveType::TzDate:
             Builder.TzDate(token);
             break;
@@ -470,7 +470,7 @@ TStringBuf Consume(NCsvFormat::CsvSplitter& splitter,
 
 TCsvParser::TCsvParser(TString&& headerRow, const char delimeter, const std::optional<TString>& nullValue,
                        const std::map<std::string, TType>* destinationTypes,
-                       const std::map<TString, TString>* paramSources) 
+                       const std::map<TString, TString>* paramSources)
     : HeaderRow(std::move(headerRow))
     , Delimeter(delimeter)
     , NullValue(nullValue)
@@ -483,7 +483,7 @@ TCsvParser::TCsvParser(TString&& headerRow, const char delimeter, const std::opt
 
 TCsvParser::TCsvParser(TVector<TString>&& header, const char delimeter, const std::optional<TString>& nullValue,
                        const std::map<std::string, TType>* destinationTypes,
-                       const std::map<TString, TString>* paramSources) 
+                       const std::map<TString, TString>* paramSources)
     : Header(std::move(header))
     , Delimeter(delimeter)
     , NullValue(nullValue)
@@ -558,17 +558,16 @@ void TCsvParser::BuildValue(TString& data, TValueBuilder& builder, const TType& 
     builder.EndStruct();
 }
 
-TValue TCsvParser::BuildList(std::vector<TString>& lines, const TString& filename, std::optional<ui64> row) const {
+TValue TCsvParser::BuildList(const std::vector<TString>& lines, const TString& filename, std::optional<ui64> row) const {
     std::vector<std::unique_ptr<TTypeParser>> columnTypeParsers;
     columnTypeParsers.reserve(ResultColumnCount);
     for (const TType* type : ResultLineTypesSorted) {
         columnTypeParsers.push_back(std::make_unique<TTypeParser>(*type));
     }
-    
     Ydb::Value listValue;
     auto* listItems = listValue.mutable_items();
     listItems->Reserve(lines.size());
-    for (auto& line : lines) {
+    for (const auto& line : lines) {
         NCsvFormat::CsvSplitter splitter(line, Delimeter);
         TParseMetadata meta {row, filename};
         auto* structItems = listItems->Add()->mutable_items();
