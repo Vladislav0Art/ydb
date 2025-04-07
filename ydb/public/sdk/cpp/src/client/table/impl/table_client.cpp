@@ -1006,7 +1006,7 @@ TAsyncBulkUpsertResult TTableClient::TImpl::BulkUpsert(const std::string& table,
 
     Connections_->RunDeferred<Ydb::Table::V1::TableService, Ydb::Table::BulkUpsertRequest, Ydb::Table::BulkUpsertResponse>(
         std::move(request),
-        extractor,
+        std::move(extractor),
         &Ydb::Table::V1::TableService::Stub::AsyncBulkUpsert,
         DbDriverState_,
         INITIAL_DEFERRED_CALL_DELAY,

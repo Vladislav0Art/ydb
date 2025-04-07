@@ -900,7 +900,7 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
             return tableClient.BulkUpsert(dbPath, std::move(builtValue), UpsertSettings)
                 .Apply([](const NYdb::NTable::TAsyncBulkUpsertResult& bulkUpsertResult) {
                     NYdb::TStatus status = bulkUpsertResult.GetValueSync();
-                    return NThreading::MakeFuture(status);
+                    return NThreading::MakeFuture(std::move(status));
                 });
         };
         // Running heavy building task on processing pool:
@@ -922,7 +922,7 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
             NYdb::TStatus status = asyncStatus.GetValueSync();
             if (!status.IsSuccess()) {
                 if (!Failed.exchange(true)) {
-                    ErrorStatus = MakeHolder<TStatus>(status);
+                    ErrorStatus = MakeHolder<TStatus>(std::move(status));
                 }
             }
             RequestsInflight->release();
@@ -958,7 +958,6 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     ui64 skippedBytes = 0;
     ui64 nextSkipBorder = VerboseModeStepSize;
 
-    TString line;
     std::vector<TAsyncStatus> inFlightRequests;
     std::vector<TString> buffer;
     std::list<std::shared_ptr<TImportBatchStatus>> batchStatuses;
@@ -1018,7 +1017,7 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     };
 
     for (ui32 i = 0; i < rowsToSkip; ++i) {
-        line = splitter.ConsumeLine();
+        TString line = splitter.ConsumeLine();
         skippedBytes += line.size();
         if (skippedBytes > nextSkipBorder && inputSizeHint.has_value() && progressCallback) {
             progressCallback(skippedBytes, *inputSizeHint); // Update progress even when skipping lines
