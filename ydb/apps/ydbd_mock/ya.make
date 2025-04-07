@@ -30,13 +30,9 @@ IF (ARCH_X86_64)
 ENDIF()
 
 PEERDIR(
-    ydb/apps/version
     ydb/core/driver_lib/run
     ydb/core/protos
     ydb/core/security
-    ydb/core/tx/schemeshard
-    ydb/core/ymq/actor
-    ydb/core/ymq/base
     ydb/library/folder_service/mock
     ydb/library/keys
     ydb/library/pdisk_io
@@ -68,7 +64,7 @@ PEERDIR(
     yql/essentials/udfs/common/yson2
     yql/essentials/udfs/logs/dsv
 #    ydb/library/breakpad
-    ydb/public/sdk/cpp/client/ydb_persqueue_public/codecs
+#    ydb/public/sdk/cpp/client/ydb_persqueue_public/codecs
 )
 
 YQL_LAST_ABI_VERSION()

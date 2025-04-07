@@ -18,12 +18,15 @@ using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::Status;
-using grpc::ServerWriter;
+// using grpc::ServerWriter;
 
 class MockOperationService final : public Ydb::Operation::V1::OperationService::Service {
 public:
-    Status GetOperation(ServerContext* /*context*/, const Ydb::Operations::GetOperationRequest* /*request*/,
-                       Ydb::Operations::GetOperationResponse* response) override {
+    Status GetOperation(
+        ServerContext* /*context*/,
+        const Ydb::Operations::GetOperationRequest* /*request*/,
+        Ydb::Operations::GetOperationResponse* response
+    ) override {
         auto* operation = new Ydb::Operations::Operation();
         operation->set_ready(true);
         operation->set_status(Ydb::StatusIds::SUCCESS);
@@ -40,20 +43,20 @@ public:
 
     Status ListEndpoints(ServerContext* /*context*/, const Ydb::Discovery::ListEndpointsRequest* /*request*/,
                         Ydb::Discovery::ListEndpointsResponse* response) override {
-        auto* endpoint = new Ydb::Discovery::EndpointInfo();
-        endpoint->set_address(address_);
-        endpoint->set_port(port_);
+        // Use stack allocation for better memory safety
+        Ydb::Discovery::EndpointInfo endpoint;
+        endpoint.set_address(address_);
+        endpoint.set_port(port_);
 
-        auto* result = new Ydb::Discovery::ListEndpointsResult();
-        result->mutable_endpoints()->AddAllocated(endpoint);
+        Ydb::Discovery::ListEndpointsResult result;
+        result.mutable_endpoints()->AddAllocated(new Ydb::Discovery::EndpointInfo(endpoint));
 
         auto* operation = new Ydb::Operations::Operation();
         operation->set_ready(true);
         operation->set_status(Ydb::StatusIds::SUCCESS);
-        operation->mutable_result()->PackFrom(*result);
+        operation->mutable_result()->PackFrom(result);  // Makes a copy of result
 
-        response->set_allocated_operation(operation);
-        delete result;
+        response->set_allocated_operation(operation);  // Transfers ownership to response
         return Status::OK;
     }
 
