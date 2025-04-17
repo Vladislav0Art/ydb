@@ -183,7 +183,7 @@ public:
     void BuildValue(const TStringBuf& token) {
         switch (Parser.GetKind()) {
         case TTypeParser::ETypeKind::Primitive: {
-            BuildPrimitive(std::string{token});
+            BuildPrimitive(static_cast<TString>(token));
             break;
         }
         case TTypeParser::ETypeKind::Decimal: {
