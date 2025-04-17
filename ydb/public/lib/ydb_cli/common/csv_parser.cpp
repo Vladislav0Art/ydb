@@ -565,8 +565,6 @@ TValue TCsvParser::BuildList(const std::vector<TString>& lines, const TString& f
         columnTypeParsers.push_back(std::make_unique<TTypeParser>(*type));
     }
 
-    const TParseMetadata meta {row, filename};
-
     Ydb::Value listValue;
     auto* listItems = listValue.mutable_items();
     listItems->Reserve(lines.size());
@@ -575,6 +573,8 @@ TValue TCsvParser::BuildList(const std::vector<TString>& lines, const TString& f
         NCsvFormat::CsvSplitter splitter(line, Delimeter);
         auto* structItems = listItems->Add()->mutable_items();
         structItems->Reserve(ResultColumnCount);
+
+        const TParseMetadata meta {row, filename};
 
         auto headerIt = Header.cbegin();
         auto skipIt = SkipBitMap.begin();
@@ -592,6 +592,7 @@ TValue TCsvParser::BuildList(const std::vector<TString>& lines, const TString& f
             ++headerIt;
             ++skipIt;
         } while (splitter.Step());
+
         if (row.has_value()) {
             ++row.value();
         }

@@ -636,6 +636,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
 
     std::vector<std::shared_ptr<TJobInFlightManager>> inflightManagers;
     std::mutex inflightManagersLock;
+
     if ((Settings.Format_ == EDataFormat::Tsv || Settings.Format_ == EDataFormat::Csv) && !Settings.NewlineDelimited_) {
         inflightManagers.reserve(filePathsSize);
         // <maxInFlight> requests in flight on server and <maxThreads> threads building TValue
@@ -699,8 +700,10 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
                             auto status = UpsertCsv(input, dbPath, filePath, fileSizeHint, progressCallback,
                                 inflightManagers.at(fileOrderNumber), progressFile);
                             std::lock_guard<std::mutex> lock(inflightManagersLock);
+
                             inflightManagers[fileOrderNumber]->Finish();
                             size_t informedManagers = 0;
+
                             for (auto& inflightManager : inflightManagers) {
                                 if (inflightManager->OnAnotherFileFinished(informedManagers)) {
                                     ++informedManagers;
