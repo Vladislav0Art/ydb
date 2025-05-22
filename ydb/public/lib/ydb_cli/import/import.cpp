@@ -1019,21 +1019,43 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
 inline
 TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferOnArena(
     const TString& dbPath, std::function<TArenaAllocatedValue(google::protobuf::Arena*)>&& buildFunc) {
-    auto arena = std::make_shared<google::protobuf::Arena>();
-
-    // For the first attempt values are built before acquiring request inflight semaphore
-    std::optional<TArenaAllocatedValue> prebuiltValue = buildFunc(arena.get());
-
-    auto retryFunc = [this, &dbPath, buildFunc = std::move(buildFunc),
-                                prebuiltValue = std::move(prebuiltValue), arena = std::move(arena)]
+    auto retryFunc = [this, &dbPath, buildFunc = std::move(buildFunc)]
             (NYdb::NTable::TTableClient& tableClient) mutable -> TAsyncStatus {
-        auto buildTValueAndSendRequest = [this, &buildFunc, &dbPath, &tableClient, &prebuiltValue, arena]() {
-            // For every retry attempt after first request build value from strings again
-            // to prevent copying data in retryFunc in a happy way when there is only one request
-            TArenaAllocatedValue builtValue = prebuiltValue.has_value() ? std::move(prebuiltValue.value()) : buildFunc(arena.get());
-            prebuiltValue = std::nullopt;
+        auto buildTValueAndSendRequest = [this, &buildFunc, &dbPath, &tableClient]() {
+            // static thread_local std::shared_ptr<google::protobuf::Arena> thread_arena = std::make_shared<google::protobuf::Arena>();
+            static thread_local google::protobuf::Arena thread_arena;
+
+            // static thread_local bool printed = false;
+            // static thread_local ui64 print_cnt = 0;
+            // static thread_local ui64 print_reset_cnt = 0;
+            // if (!printed) {
+            //     std::cerr << "Arena " << thread_arena.get()
+            //          << " created by thread " << std::this_thread::get_id() << std::endl;
+            //     printed = true;
+            // }
+
+            // if (print_cnt % 100 == 0) {
+            //     std::cerr << "Arena " << thread_arena.get()
+            //          << " used " << PrettifyBytes(thread_arena->SpaceUsed()) << " bytes "
+            //          << " on thread " << std::this_thread::get_id() << std::endl;
+            // }
+
+            if (thread_arena.SpaceUsed() > Settings.ArenaSizeThreshold_) {
+                // if (print_reset_cnt % 100 == 0) {
+                //     std::cerr << "Reset arena " << thread_arena.get()
+                //         << " used " << PrettifyBytes(thread_arena->SpaceUsed()) << " bytes "
+                //          << " on thread " << std::this_thread::get_id() << std::endl;
+                // }
+                // arena = std::make_shared<google::protobuf::Arena>();
+                thread_arena.Reset();
+                //++print_reset_cnt;
+            }
+            // ++print_cnt;
+
+            TArenaAllocatedValue builtValue = buildFunc(&thread_arena);
+
             return tableClient.BulkUpsertUnretryableArenaAllocated(
-                dbPath, std::move(builtValue), arena.get(), UpsertSettings)
+                dbPath, std::move(builtValue), &thread_arena, UpsertSettings)
                 .Apply([](const NYdb::NTable::TAsyncBulkUpsertResult& bulkUpsertResult) {
                     NYdb::TStatus status = bulkUpsertResult.GetValueSync();
                     return NThreading::MakeFuture(status);

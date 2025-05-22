@@ -1023,6 +1023,7 @@ TAsyncBulkUpsertResult TTableClient::TImpl::BulkUpsertUnretryableArenaAllocated(
     const TBulkUpsertSettings& settings
 ) {
     auto request = MakeOperationRequestOnArena<Ydb::Table::BulkUpsertRequest>(settings, arena);
+
     // std::cout << "request->GetArena(): " << request->GetArena() << "\n"
     //           << "request->mutable_rows()->GetArena(): " << request->mutable_rows()->GetArena() << "\n"
     //           << "Value->GetArena(): " << rows.second->GetArena() << "\n"
@@ -1033,6 +1034,8 @@ TAsyncBulkUpsertResult TTableClient::TImpl::BulkUpsertUnretryableArenaAllocated(
     // TODO: Ydb::Type still gets copied because request is arena-allocated and rows' Type is not
     *request->mutable_rows()->mutable_type() = std::move(rows.GetType()).ExtractProto();
     *request->mutable_rows()->mutable_value() = std::move(rows).ExtractProto();
+
+    // std::cerr << "request->ByteSizeLong(): " << request->ByteSizeLong() * 1.0 / 1024 / 1024 << " MB" << std::endl;
 
     auto promise = NewPromise<TBulkUpsertResult>();
 

@@ -50,6 +50,7 @@ struct TImportFileSettings : public TOperationRequestSettings<TImportFileSetting
     FLUENT_SETTING_DEFAULT(ui64, BytesPerRequest, 1_MB);
     FLUENT_SETTING_DEFAULT(ui64, FileBufferSize, 2_MB);
     FLUENT_SETTING_DEFAULT(ui64, MaxInFlightRequests, 100);
+    FLUENT_SETTING_DEFAULT(ui64, ArenaSizeThreshold, 128_MB);
     // Main thread that reads input file is CPU intensive so make room for it too
     FLUENT_SETTING_DEFAULT(ui64, Threads, std::thread::hardware_concurrency() > 1 ? std::thread::hardware_concurrency() - 1 : 1);
     // Settings below are for CSV format only
