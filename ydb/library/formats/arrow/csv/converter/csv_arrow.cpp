@@ -152,6 +152,7 @@ std::shared_ptr<arrow::RecordBatch> TArrowCSV::ConvertColumnTypes(std::shared_pt
 
     auto resultSchemaFixed = sBuilderFixed.Finish();
     Y_ABORT_UNLESS(resultSchemaFixed.ok());
+
     return arrow::RecordBatch::Make(*resultSchemaFixed, parsedBatch->num_rows(), resultColumns);
 }
 

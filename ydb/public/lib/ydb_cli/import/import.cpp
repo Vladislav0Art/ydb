@@ -27,6 +27,7 @@
 #include <library/cpp/string_utils/csv/csv.h>
 #include <library/cpp/threading/future/async.h>
 #include <library/cpp/yaml/as/tstring.h>
+#include <ydb/library/formats/arrow/csv/table/table.h>
 
 #include <util/folder/path.h>
 #include <util/generic/vector.h>
@@ -561,6 +562,16 @@ private:
     TAsyncStatus UpsertTValueBuffer(const TString& dbPath, TValueBuilder& builder);
     TAsyncStatus UpsertTValueBuffer(const TString& dbPath, std::function<TValue()>&& buildFunc);
 
+
+    TAsyncStatus UpsertTValueBufferParquet(
+        const TString& dbPath,
+        TStringBuilder&& data,
+        const Ydb::Formats::CsvSettings& csvSettings,
+        const arrow::ipc::IpcWriteOptions& writeOptions,
+        arrow::Result<NKikimr::NFormats::TArrowCSV>& arrowCsv
+    );
+
+
     TAsyncStatus UpsertTValueBufferOnArena(
         const TString& dbPath, std::function<TArenaAllocatedValue(google::protobuf::Arena*)>&& buildFunc);
 
@@ -687,6 +698,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
     };
 
     auto start = TInstant::Now();
+
 
 
     TThreadPool jobPool(IThreadPool::TParams().SetThreadNamePrefix("FileWorker"));
@@ -874,6 +886,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
     return MakeStatus(EStatus::SUCCESS);
 }
 
+
 std::shared_ptr<TProgressFile> TImportFileClient::TImpl::LoadOrStartImportProgress(const TString& filePath) {
     std::shared_ptr<TProgressFile> progressFile;
     if (Settings.Format_ == EDataFormat::Csv || Settings.Format_ == EDataFormat::Tsv) {
@@ -1022,6 +1035,78 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
 }
 
 
+static int a = 0;
+
+inline
+TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferParquet(
+    const TString& dbPath,
+    TStringBuilder&& data,
+    const Ydb::Formats::CsvSettings& csvSettings,
+    const arrow::ipc::IpcWriteOptions& writeOptions,
+    // TODO: should arrow be created every time on a new batch?
+    arrow::Result<NKikimr::NFormats::TArrowCSV>& arrowCsv
+) {
+    //!
+    if (a == 0) {
+        std::cerr << "data[UpsertTValueBufferParquet]:\n" << data.substr(0, 450) << std::endl;
+
+        std::cerr << "settings:\n" << csvSettings.DebugString() << std::endl;
+        a++;
+    }
+
+    TString error;
+    if (auto batch = arrowCsv->ReadSingleBatch(data, csvSettings, error)) {
+        std::cerr << "[UpsertTValueBufferParquet] batch: " << batch->num_rows() << std::endl;
+        if (error) {
+            //! TODO: what to do here?
+            return NThreading::MakeFuture(
+                TStatus(EStatus::INTERNAL_ERROR, NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(error)}))
+            );
+        }
+
+        if (!RequestsInflight->try_acquire()) {
+            if (Settings.Verbose_ && Settings.NewlineDelimited_) {
+                if (!InformedAboutLimit.exchange(true)) {
+                    Cerr << (TStringBuilder() << "@ (each '@' means max request inflight is reached and a worker thread is waiting for "
+                    "any response from database)" << Endl);
+                } else {
+                    Cerr << '@';
+                }
+            }
+            RequestsInflight->acquire();
+        }
+
+        auto retryFunc = [parquet = NYdb_cli::NArrow::SerializeBatch(batch, writeOptions),
+                schema = NYdb_cli::NArrow::SerializeSchema(*batch->schema()),
+                dbPath](NTable::TTableClient& client) {
+            std::cerr << "[BulkUpsert] parquet: " << parquet.size() <<  ", schema: " << schema.size() << std::endl;
+            return client.BulkUpsert(dbPath, NTable::EDataFormat::ApacheArrow, parquet, schema)
+                .Apply([](const NTable::TAsyncBulkUpsertResult& result) {
+                    return TStatus(result.GetValueSync());
+                });
+        };
+
+        return TableClient->RetryOperation(std::move(retryFunc), RetrySettings)
+            .Apply([this](const TAsyncStatus& asyncStatus) {
+                NYdb::TStatus status = asyncStatus.GetValueSync();
+                if (!status.IsSuccess()) {
+                    if (!Failed.exchange(true)) {
+                        ErrorStatus = MakeHolder<TStatus>(status);
+                    }
+                }
+                RequestsInflight->release();
+                return asyncStatus;
+            });
+    }
+    else {
+        std::cerr << "[UpsertTValueBufferParquet] error: " << error << std::endl;
+        return NThreading::MakeFuture(
+            TStatus(EStatus::INTERNAL_ERROR, NYdb::NIssue::TIssues({NYdb::NIssue::TIssue("Could not create batch")}))
+        );
+    }
+}
+
+
 
 
 
@@ -1141,34 +1226,63 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
         }
     };
 
-    auto upsertCsvFunc = [&](std::vector<TString>&& buffer, ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) {
-        // auto buildFunc = [&, buffer = std::move(buffer), row, this] () mutable {
-        //     try {
-        //         return parser.BuildList(buffer, filePath, row);
-        //     } catch (const std::exception& e) {
-        //         if (!Failed.exchange(true)) {
-        //             ErrorStatus = MakeHolder<TStatus>(MakeStatus(EStatus::INTERNAL_ERROR, e.what()));
-        //         }
-        //         jobInflightManager->ReleaseJob();
-        //         throw;
+
+    //!
+    // table = dbPath (path to the table on the server)
+    auto columns = DbTableInfo->GetTableColumns();
+
+    std::cerr << "columns: " << columns.size() << std::endl;
+    for (const auto& column : columns) {
+        std::cerr << "column: " << column.Name << " " << column.Type.ToString() << std::endl;
+    }
+
+    // TODO: `TzDatetime` type is not supported in table columns (https://ydb.tech/docs/en/yql/reference/types/primitive)
+    // TODO: thus, `TArrowCSVTable::Create` will fail. We can make a fallback on the arena-based solution.
+    auto arrowCsv = NKikimr::NFormats::TArrowCSVTable::Create(columns, true);
+    if (!arrowCsv.ok()) {
+        std::cerr << "Could not create arrow csv table: " << arrowCsv.status().ToString() << std::endl;
+        return TStatus(
+            EStatus::INTERNAL_ERROR,
+            NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(arrowCsv.status().ToString())})
+        );
+    }
+
+    const Ydb::Formats::CsvSettings csvSettings = ([this]() {
+        Ydb::Formats::CsvSettings settings;
+        settings.set_delimiter(Settings.Delimiter_);
+        settings.set_header(Settings.Header_);
+        if (Settings.NullValue_.has_value()) {
+            settings.set_null_value(Settings.NullValue_.value());
+        }
+        settings.set_skip_rows(Settings.SkipRows_);
+        return settings;
+    }());
+
+    auto writeOptions = arrow::ipc::IpcWriteOptions::Defaults();
+    constexpr auto codecType = arrow::Compression::type::ZSTD;
+    writeOptions.codec = *arrow::util::Codec::Create(codecType);
+    //!
+
+    auto upsertCsvFunc = [&](std::vector<TString>&& buffer, [[maybe_unused]] ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) {
+        //!
+        // i64 cnt = 0;
+        // for (auto& row : buffer) {
+        //     cnt++;
+        //     std::cerr << "row[buffer]: " << row << std::endl;
+        //     if (cnt > 2) {
+        //         break;
         //     }
-        // };
+        // }
 
-        auto buildOnArenaFunc = [&, buffer = std::move(buffer), row, this] (google::protobuf::Arena* arena) mutable {
-            try {
-                return parser.BuildListOnArena(buffer, filePath, arena, row);
-            } catch (const std::exception& e) {
-                if (!Failed.exchange(true)) {
-                    ErrorStatus = MakeHolder<TStatus>(MakeStatus(EStatus::INTERNAL_ERROR, e.what()));
-                }
-                jobInflightManager->ReleaseJob();
-                throw;
-            }
-        };
+        const i64 estimatedCsvLineLength = (!buffer.empty() ? 2 * buffer.front().size() : 10'000);
+        TStringBuilder data;
+        data.reserve(buffer.size() * estimatedCsvLineLength);
+        data << JoinSeq("\n", buffer) << Endl;
+        // std::cerr << "data: " << data << std::endl;
 
-        // TODO: create arena here and pass it to UpsertTValueBufferOnArena?
-        // UpsertTValueBuffer(dbPath, std::move(buildFunc))
-        UpsertTValueBufferOnArena(dbPath, std::move(buildOnArenaFunc))
+        // std::cerr << "[UpsertCsvFunc, sending batch] data: " << data.size() << std::endl;
+
+        UpsertTValueBufferParquet(dbPath, std::move(data), csvSettings, writeOptions, arrowCsv)
             .Apply([&, batchStatus](const TAsyncStatus& asyncStatus) {
                 jobInflightManager->ReleaseJob();
                 if (asyncStatus.GetValueSync().IsSuccess()) {
@@ -1180,6 +1294,7 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
                 }
                 return asyncStatus;
             });
+        //!
     };
 
     for (ui32 i = 0; i < rowsToSkip; ++i) {
