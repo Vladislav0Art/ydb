@@ -1046,7 +1046,8 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferParquet(
     //!
     // TODO: `TzDatetime` type is not supported in table columns (https://ydb.tech/docs/en/yql/reference/types/primitive)
     // TODO: thus, `TArrowCSVTable::Create` will fail. We can make a fallback on the arena-based solution.
-    auto arrowCsv = NKikimr::NFormats::TArrowCSVTable::Create(columns, false);
+    // if header is present, it is expected to be the first line of the data
+    auto arrowCsv = NKikimr::NFormats::TArrowCSVTable::Create(columns, Settings.Header_);
     if (!arrowCsv.ok()) {
         std::cerr << "Could not create arrow csv table: " << arrowCsv.status().ToString() << std::endl;
         return NThreading::MakeFuture(
@@ -1262,7 +1263,11 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
         //!
         const i64 estimatedCsvLineLength = (!buffer.empty() ? 2 * buffer.front().size() : 10'000);
         TStringBuilder data;
-        data.reserve(buffer.size() * estimatedCsvLineLength);
+        data.reserve((buffer.size() + 1) * estimatedCsvLineLength);
+        // insert header if it is present in the given csv file
+        if (Settings.Header_) {
+            data << parser.GetHeaderRow() << Endl;
+        }
         data << JoinSeq("\n", buffer) << Endl;
 
         UpsertTValueBufferParquet(dbPath, std::move(data), csvSettings, writeOptions, columns)
