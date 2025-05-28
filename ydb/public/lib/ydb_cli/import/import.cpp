@@ -568,7 +568,6 @@ private:
         TStringBuilder&& data,
         const Ydb::Formats::CsvSettings& csvSettings,
         const arrow::ipc::IpcWriteOptions& writeOptions,
-        // arrow::Result<NKikimr::NFormats::TArrowCSV>& arrowCsv
         const std::vector<NYdb::NTable::TTableColumn>& columns
     );
 
@@ -1042,8 +1041,6 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferParquet(
     TStringBuilder&& data,
     const Ydb::Formats::CsvSettings& csvSettings,
     const arrow::ipc::IpcWriteOptions& writeOptions,
-    // TODO: should arrow be created every time on a new batch?
-    // arrow::Result<NKikimr::NFormats::TArrowCSV>& arrowCsv
     const std::vector<NYdb::NTable::TTableColumn>& columns
 ) {
     //!
