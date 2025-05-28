@@ -568,7 +568,8 @@ private:
         TStringBuilder&& data,
         const Ydb::Formats::CsvSettings& csvSettings,
         const arrow::ipc::IpcWriteOptions& writeOptions,
-        arrow::Result<NKikimr::NFormats::TArrowCSV>& arrowCsv
+        // arrow::Result<NKikimr::NFormats::TArrowCSV>& arrowCsv
+        const std::vector<NYdb::NTable::TTableColumn>& columns
     );
 
 
@@ -1035,8 +1036,6 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
 }
 
 
-static int a = 0;
-
 inline
 TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferParquet(
     const TString& dbPath,
@@ -1044,19 +1043,25 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferParquet(
     const Ydb::Formats::CsvSettings& csvSettings,
     const arrow::ipc::IpcWriteOptions& writeOptions,
     // TODO: should arrow be created every time on a new batch?
-    arrow::Result<NKikimr::NFormats::TArrowCSV>& arrowCsv
+    // arrow::Result<NKikimr::NFormats::TArrowCSV>& arrowCsv
+    const std::vector<NYdb::NTable::TTableColumn>& columns
 ) {
     //!
-    if (a == 0) {
-        std::cerr << "data[UpsertTValueBufferParquet]:\n" << data.substr(0, 450) << std::endl;
-
-        std::cerr << "settings:\n" << csvSettings.DebugString() << std::endl;
-        a++;
+    // TODO: `TzDatetime` type is not supported in table columns (https://ydb.tech/docs/en/yql/reference/types/primitive)
+    // TODO: thus, `TArrowCSVTable::Create` will fail. We can make a fallback on the arena-based solution.
+    auto arrowCsv = NKikimr::NFormats::TArrowCSVTable::Create(columns, false);
+    if (!arrowCsv.ok()) {
+        std::cerr << "Could not create arrow csv table: " << arrowCsv.status().ToString() << std::endl;
+        return NThreading::MakeFuture(
+            TStatus(
+                EStatus::INTERNAL_ERROR,
+                NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(arrowCsv.status().ToString())})
+            )
+        );
     }
 
     TString error;
     if (auto batch = arrowCsv->ReadSingleBatch(data, csvSettings, error)) {
-        std::cerr << "[UpsertTValueBufferParquet] batch: " << batch->num_rows() << std::endl;
         if (error) {
             //! TODO: what to do here?
             return NThreading::MakeFuture(
@@ -1079,7 +1084,6 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferParquet(
         auto retryFunc = [parquet = NYdb_cli::NArrow::SerializeBatch(batch, writeOptions),
                 schema = NYdb_cli::NArrow::SerializeSchema(*batch->schema()),
                 dbPath](NTable::TTableClient& client) {
-            std::cerr << "[BulkUpsert] parquet: " << parquet.size() <<  ", schema: " << schema.size() << std::endl;
             return client.BulkUpsert(dbPath, NTable::EDataFormat::ApacheArrow, parquet, schema)
                 .Apply([](const NTable::TAsyncBulkUpsertResult& result) {
                     return TStatus(result.GetValueSync());
@@ -1193,6 +1197,11 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     ui64 skippedBytes = 0;
     ui64 nextSkipBorder = VerboseModeStepSize;
 
+    std::cerr << "Settings.Header_: " << Settings.Header_ << std::endl;
+    std::cerr << "Settings.SkipRows_: " << Settings.SkipRows_ << std::endl;
+    std::cerr << "rowsToSkip: " << rowsToSkip << std::endl;
+    std::cerr << "row: " << row << std::endl;
+
     TString line;
     std::vector<TAsyncStatus> inFlightRequests;
     std::vector<TString> buffer;
@@ -1236,17 +1245,6 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
         std::cerr << "column: " << column.Name << " " << column.Type.ToString() << std::endl;
     }
 
-    // TODO: `TzDatetime` type is not supported in table columns (https://ydb.tech/docs/en/yql/reference/types/primitive)
-    // TODO: thus, `TArrowCSVTable::Create` will fail. We can make a fallback on the arena-based solution.
-    auto arrowCsv = NKikimr::NFormats::TArrowCSVTable::Create(columns, true);
-    if (!arrowCsv.ok()) {
-        std::cerr << "Could not create arrow csv table: " << arrowCsv.status().ToString() << std::endl;
-        return TStatus(
-            EStatus::INTERNAL_ERROR,
-            NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(arrowCsv.status().ToString())})
-        );
-    }
-
     const Ydb::Formats::CsvSettings csvSettings = ([this]() {
         Ydb::Formats::CsvSettings settings;
         settings.set_delimiter(Settings.Delimiter_);
@@ -1259,30 +1257,18 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     }());
 
     auto writeOptions = arrow::ipc::IpcWriteOptions::Defaults();
-    constexpr auto codecType = arrow::Compression::type::ZSTD;
+    constexpr auto codecType = arrow::Compression::type::UNCOMPRESSED; // ZSTD
     writeOptions.codec = *arrow::util::Codec::Create(codecType);
     //!
 
     auto upsertCsvFunc = [&](std::vector<TString>&& buffer, [[maybe_unused]] ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) {
         //!
-        // i64 cnt = 0;
-        // for (auto& row : buffer) {
-        //     cnt++;
-        //     std::cerr << "row[buffer]: " << row << std::endl;
-        //     if (cnt > 2) {
-        //         break;
-        //     }
-        // }
-
         const i64 estimatedCsvLineLength = (!buffer.empty() ? 2 * buffer.front().size() : 10'000);
         TStringBuilder data;
         data.reserve(buffer.size() * estimatedCsvLineLength);
         data << JoinSeq("\n", buffer) << Endl;
-        // std::cerr << "data: " << data << std::endl;
 
-        // std::cerr << "[UpsertCsvFunc, sending batch] data: " << data.size() << std::endl;
-
-        UpsertTValueBufferParquet(dbPath, std::move(data), csvSettings, writeOptions, arrowCsv)
+        UpsertTValueBufferParquet(dbPath, std::move(data), csvSettings, writeOptions, columns)
             .Apply([&, batchStatus](const TAsyncStatus& asyncStatus) {
                 jobInflightManager->ReleaseJob();
                 if (asyncStatus.GetValueSync().IsSuccess()) {
