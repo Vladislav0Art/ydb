@@ -572,9 +572,6 @@ private:
     );
 
 
-    TAsyncStatus UpsertTValueBufferOnArena(
-        const TString& dbPath, std::function<TArenaAllocatedValue(google::protobuf::Arena*)>&& buildFunc);
-
     TStatus UpsertJson(IInputStream &input, const TString &dbPath, std::optional<ui64> inputSizeHint,
                        ProgressCallbackFunc & progressCallback);
     TStatus UpsertParquet(const TString& filename, const TString& dbPath, ProgressCallbackFunc & progressCallback);
@@ -1107,63 +1104,6 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferParquet(
         );
     }
 }
-
-
-
-
-
-inline
-TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferOnArena(
-    const TString& dbPath, std::function<TArenaAllocatedValue(google::protobuf::Arena*)>&& buildFunc) {
-    auto arena = std::make_shared<google::protobuf::Arena>();
-
-    // For the first attempt values are built before acquiring request inflight semaphore
-    std::optional<TArenaAllocatedValue> prebuiltValue = buildFunc(arena.get());
-
-    auto retryFunc = [this, &dbPath, buildFunc = std::move(buildFunc),
-                                prebuiltValue = std::move(prebuiltValue), arena = std::move(arena)]
-            (NYdb::NTable::TTableClient& tableClient) mutable -> TAsyncStatus {
-        auto buildTValueAndSendRequest = [this, &buildFunc, &dbPath, &tableClient, &prebuiltValue, arena]() {
-            // For every retry attempt after first request build value from strings again
-            // to prevent copying data in retryFunc in a happy way when there is only one request
-            TArenaAllocatedValue builtValue = prebuiltValue.has_value() ? std::move(prebuiltValue.value()) : buildFunc(arena.get());
-            prebuiltValue = std::nullopt;
-            return tableClient.BulkUpsertUnretryableArenaAllocated(
-                dbPath, std::move(builtValue), arena.get(), UpsertSettings)
-                .Apply([](const NYdb::NTable::TAsyncBulkUpsertResult& bulkUpsertResult) {
-                    NYdb::TStatus status = bulkUpsertResult.GetValueSync();
-                    return NThreading::MakeFuture(status);
-                });
-        };
-        // Running heavy building task on processing pool:
-        return NThreading::Async(std::move(buildTValueAndSendRequest), *ProcessingPool);
-    };
-    if (!RequestsInflight->try_acquire()) {
-        if (Settings.Verbose_ && Settings.NewlineDelimited_) {
-            if (!InformedAboutLimit.exchange(true)) {
-                Cerr << (TStringBuilder() << "@ (each '@' means max request inflight is reached and a worker thread is waiting for "
-                "any response from database)" << Endl);
-            } else {
-                Cerr << '@';
-            }
-        }
-        RequestsInflight->acquire();
-    }
-    return TableClient->RetryOperation(std::move(retryFunc), RetrySettings)
-        .Apply([this](const TAsyncStatus& asyncStatus) {
-            NYdb::TStatus status = asyncStatus.GetValueSync();
-            if (!status.IsSuccess()) {
-                if (!Failed.exchange(true)) {
-                    ErrorStatus = MakeHolder<TStatus>(status);
-                }
-            }
-            RequestsInflight->release();
-            return asyncStatus;
-        });
-}
-
-
-
 
 
 
