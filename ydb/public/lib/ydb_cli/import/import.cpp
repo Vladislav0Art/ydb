@@ -680,7 +680,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
 
     TProgressBar progressBar(100);
 
-    auto writeProgress = [&]() {
+    [[maybe_unused]] auto writeProgress = [&]() {
         ui64 globalProgressValue = globalProgress.load();
         std::lock_guard<std::mutex> lock(progressWriteLock);
         progressBar.SetProcess(globalProgressValue / filePathsSize);
@@ -764,7 +764,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
                     if (progressDiff > 0) {
                         globalProgress.fetch_add(progressDiff);
                         oldProgress = progress;
-                        writeProgress();
+                        // writeProgress();
                     }
                 };
             }
