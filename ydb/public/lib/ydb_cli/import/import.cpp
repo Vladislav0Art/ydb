@@ -850,7 +850,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
 
     auto finish = TInstant::Now();
     auto duration = finish - start;
-    progressBar.SetProcess(100);
+    // progressBar.SetProcess(100);
     if (duration.SecondsFloat() > 0) {
         std::cerr << "Elapsed: " << std::setprecision(3) << duration.SecondsFloat() << " sec. Total read size: "
             << PrettifyBytes(TotalBytesRead) << ". Average processing speed: "
