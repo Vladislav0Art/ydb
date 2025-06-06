@@ -1163,7 +1163,8 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
         }
     };
 
-    auto upsertCsvFunc = [&](std::vector<TString>&& buffer, ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) {
+    auto upsertCsvFunc = [&](std::vector<TString>&& buffer, ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus)
+        -> NThreading::TFuture<NYdb::TStatus> {
         // auto buildFunc = [&, buffer = std::move(buffer), row, this] () mutable {
         //     try {
         //         return parser.BuildList(buffer, filePath, row);
@@ -1190,7 +1191,7 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
 
         // TODO: create arena here and pass it to UpsertTValueBufferOnArena?
         // UpsertTValueBuffer(dbPath, std::move(buildFunc))
-        UpsertTValueBufferOnArena(dbPath, std::move(buildOnArenaFunc))
+        return UpsertTValueBufferOnArena(dbPath, std::move(buildOnArenaFunc))
             .Apply([&, batchStatus](const TAsyncStatus& asyncStatus) {
                 jobInflightManager->ReleaseJob();
                 if (asyncStatus.GetValueSync().IsSuccess()) {
@@ -1212,6 +1213,34 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             nextSkipBorder += VerboseModeStepSize;
         }
     }
+
+
+
+    const ui64 samplingInterval_ms = 1000; // seconds
+    ui64 bytesUploadedTotal = 0;
+    ui64 bytesUploadedOnLastSample = 0;
+    TInstant lastSampleTime = TInstant::Zero();
+    std::mutex samplingMutex;
+
+    auto doSampling = [&bytesUploadedTotal, &bytesUploadedOnLastSample, &lastSampleTime, &samplingMutex](ui64 batchBytes) {
+        auto currentTime = TInstant::Now();
+        std::lock_guard<std::mutex> lock(samplingMutex);
+
+        bytesUploadedTotal += batchBytes;
+
+        auto timeDiff = currentTime - lastSampleTime;
+        if (timeDiff.MilliSeconds() > samplingInterval_ms) {
+            // do sampling
+            ui64 bytesUploadedSinceLastSample = bytesUploadedTotal - bytesUploadedOnLastSample;
+
+            auto uploadSpeedMiBPerSec = static_cast<double>(bytesUploadedSinceLastSample) / timeDiff.SecondsFloat() / (1024 * 1024);
+            std::cout << "[sample]: uploadSpeedMiBPerSec: " << std::setprecision(5) << uploadSpeedMiBPerSec << " MiB/s" << std::endl;
+
+            lastSampleTime = currentTime;
+            bytesUploadedOnLastSample = bytesUploadedTotal;
+        }
+    };
+
 
     while (TString line = splitter.ConsumeLine()) {
         ++batchRows;
@@ -1244,9 +1273,12 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             progressCallback(skippedBytes + readBytes, *inputSizeHint);
         }
 
-        auto workerFunc = [&upsertCsvFunc, row, buffer = std::move(buffer),
+        auto workerFunc = [&doSampling, &upsertCsvFunc, batchBytes, row, buffer = std::move(buffer),
                 batchStatus = createStatus(row + batchRows)]() mutable {
-            upsertCsvFunc(std::move(buffer), row, batchStatus);
+            upsertCsvFunc(std::move(buffer), row, batchStatus)
+                .Subscribe([&doSampling, batchBytes](const NThreading::TFuture<NYdb::TStatus>&) {
+                    doSampling(batchBytes);
+                });
         };
         row += batchRows;
         batchRows = 0;
@@ -1267,7 +1299,10 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     // Send the rest if buffer is not empty
     if (!buffer.empty() && countInput.Counter() > 0 && !Failed) {
         jobInflightManager->AcquireJob();
-        upsertCsvFunc(std::move(buffer), row, createStatus(row + batchRows));
+        upsertCsvFunc(std::move(buffer), row, createStatus(row + batchRows))
+            .Subscribe([&doSampling, batchBytes](const NThreading::TFuture<NYdb::TStatus>&) {
+                doSampling(batchBytes);
+            });
     }
 
     jobInflightManager->WaitForAllJobs();
