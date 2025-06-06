@@ -1199,18 +1199,18 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     writeOptions.codec = *arrow::util::Codec::Create(codecType);
     //!
 
-    auto upsertCsvFunc = [&](std::vector<TString>&& buffer, [[maybe_unused]] ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) {
+    auto upsertCsvFunc = [&](std::vector<TString>&& buffer, [[maybe_unused]] ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) -> NThreading::TFuture<NYdb::TStatus> {
         //!
         const i64 estimatedCsvLineLength = (!buffer.empty() ? 2 * buffer.front().size() : 10'000);
         TStringBuilder data;
-        data.reserve((buffer.size() + 1) * estimatedCsvLineLength);
+        data.reserve((buffer.size() + (Settings.Header_ ? 1 : 0)) * estimatedCsvLineLength);
         // insert header if it is present in the given csv file
         if (Settings.Header_) {
             data << parser.GetHeaderRow() << Endl;
         }
         data << JoinSeq("\n", buffer) << Endl;
 
-        UpsertTValueBufferParquet(dbPath, std::move(data), csvSettings, writeOptions, columns)
+        return UpsertTValueBufferParquet(dbPath, std::move(data), csvSettings, writeOptions, columns)
             .Apply([&, batchStatus](const TAsyncStatus& asyncStatus) {
                 jobInflightManager->ReleaseJob();
                 if (asyncStatus.GetValueSync().IsSuccess()) {
@@ -1233,6 +1233,34 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             nextSkipBorder += VerboseModeStepSize;
         }
     }
+
+
+
+    const ui64 samplingInterval_ms = 1000; // seconds
+    ui64 bytesUploadedTotal = 0;
+    ui64 bytesUploadedOnLastSample = 0;
+    TInstant lastSampleTime = TInstant::Zero();
+    std::mutex samplingMutex;
+
+    auto doSampling = [&bytesUploadedTotal, &bytesUploadedOnLastSample, &lastSampleTime, &samplingMutex](ui64 batchBytes) {
+        auto currentTime = TInstant::Now();
+        std::lock_guard<std::mutex> lock(samplingMutex);
+
+        bytesUploadedTotal += batchBytes;
+
+        auto timeDiff = currentTime - lastSampleTime;
+        if (timeDiff.MilliSeconds() > samplingInterval_ms) {
+            // do sampling
+            ui64 bytesUploadedSinceLastSample = bytesUploadedTotal - bytesUploadedOnLastSample;
+
+            auto uploadSpeedMiBPerSec = static_cast<double>(bytesUploadedSinceLastSample) / timeDiff.SecondsFloat() / (1024 * 1024);
+            std::cout << "[sample]: uploadSpeedMiBPerSec: " << std::setprecision(5) << uploadSpeedMiBPerSec << " MiB/s" << std::endl;
+
+            lastSampleTime = currentTime;
+            bytesUploadedOnLastSample = bytesUploadedTotal;
+        }
+    };
+
 
     while (TString line = splitter.ConsumeLine()) {
         ++batchRows;
@@ -1265,9 +1293,12 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             progressCallback(skippedBytes + readBytes, *inputSizeHint);
         }
 
-        auto workerFunc = [&upsertCsvFunc, row, buffer = std::move(buffer),
+        auto workerFunc = [&doSampling, &upsertCsvFunc, batchBytes, row, buffer = std::move(buffer),
                 batchStatus = createStatus(row + batchRows)]() mutable {
-            upsertCsvFunc(std::move(buffer), row, batchStatus);
+            upsertCsvFunc(std::move(buffer), row, batchStatus)
+                .Subscribe([&doSampling, batchBytes](const NThreading::TFuture<NYdb::TStatus>&) {
+                    doSampling(batchBytes);
+                });
         };
         row += batchRows;
         batchRows = 0;
@@ -1288,7 +1319,10 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     // Send the rest if buffer is not empty
     if (!buffer.empty() && countInput.Counter() > 0 && !Failed) {
         jobInflightManager->AcquireJob();
-        upsertCsvFunc(std::move(buffer), row, createStatus(row + batchRows));
+        upsertCsvFunc(std::move(buffer), row, createStatus(row + batchRows))
+            .Subscribe([&doSampling, batchBytes](const NThreading::TFuture<NYdb::TStatus>&) {
+                doSampling(batchBytes);
+            });
     }
 
     jobInflightManager->WaitForAllJobs();
