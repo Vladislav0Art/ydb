@@ -1236,13 +1236,14 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
 
 
 
-    const ui64 samplingInterval_ms = 1000; // seconds
+    const ui64 samplingInterval_ms = 1000;
+    const TInstant samplingStartTime = TInstant::Now();
     ui64 bytesUploadedTotal = 0;
     ui64 bytesUploadedOnLastSample = 0;
     TInstant lastSampleTime = TInstant::Zero();
     std::mutex samplingMutex;
 
-    auto doSampling = [&bytesUploadedTotal, &bytesUploadedOnLastSample, &lastSampleTime, &samplingMutex](ui64 batchBytes) {
+    auto doSampling = [&bytesUploadedTotal, &bytesUploadedOnLastSample, &lastSampleTime, &samplingMutex, &samplingStartTime](ui64 batchBytes) {
         auto currentTime = TInstant::Now();
         std::lock_guard<std::mutex> lock(samplingMutex);
 
@@ -1254,7 +1255,9 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             ui64 bytesUploadedSinceLastSample = bytesUploadedTotal - bytesUploadedOnLastSample;
 
             auto uploadSpeedMiBPerSec = static_cast<double>(bytesUploadedSinceLastSample) / timeDiff.SecondsFloat() / (1024 * 1024);
-            std::cout << "[sample]: uploadSpeedMiBPerSec: " << std::setprecision(5) << uploadSpeedMiBPerSec << " MiB/s" << std::endl;
+            std::cout << "[sample]: "
+                      << "timeElapsedSec: " << (currentTime - samplingStartTime).SecondsFloat() << " s "
+                      << "uploadSpeedMiBPerSec: " << std::setprecision(5) << uploadSpeedMiBPerSec << " MiB/s" << std::endl;
 
             lastSampleTime = currentTime;
             bytesUploadedOnLastSample = bytesUploadedTotal;
