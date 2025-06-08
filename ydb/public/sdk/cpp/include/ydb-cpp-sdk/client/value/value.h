@@ -2,10 +2,12 @@
 
 #include "fwd.h"
 
+#include <google/protobuf/arena.h>
 #include <util/datetime/base.h>
 
 #include <optional>
 #include <memory>
+#include <ydb/public/api/protos/ydb_value.pb.h>
 
 namespace Ydb {
     class Type;
@@ -28,6 +30,8 @@ public:
 
     const Ydb::Type& GetProto() const;
     Ydb::Type& GetProto();
+
+    Ydb::Type&& ExtractProto() &&;
 
 private:
     class TImpl;
@@ -170,6 +174,7 @@ std::string FormatType(const TType& type);
 //! To create complex type, corresponding scope should be opened by Begin*/End* calls
 //! To create complex repeated type, Add* should be called at least once
 class TTypeBuilder : public TMoveOnly {
+    template<typename ValueHolder>
     friend class TValueBuilderImpl;
 public:
     TTypeBuilder(TTypeBuilder&&);
@@ -271,15 +276,35 @@ public:
     TValue(const TType& type, Ydb::Value&& valueProto);
 
     const TType& GetType() const;
-    TType & GetType();
+    TType& GetType();
 
     const Ydb::Value& GetProto() const;
     Ydb::Value& GetProto();
+
+    Ydb::Value&& ExtractProto() &&;
 
 private:
     class TImpl;
     std::shared_ptr<TImpl> Impl_;
 };
+
+class TArenaAllocatedValue {
+public:
+    TArenaAllocatedValue(const TType& type, Ydb::Value* value);
+
+    const TType& GetType() const;
+    TType& GetType();
+
+    const Ydb::Value* GetProto() const;
+    Ydb::Value* GetProto();
+
+    Ydb::Value&& ExtractProto() &&;
+
+private:
+    class TImpl;
+    std::shared_ptr<TImpl> Impl_;
+};
+
 
 class TValueParser : public TMoveOnly {
     friend class TResultSetParser;
@@ -400,9 +425,59 @@ private:
     std::unique_ptr<TImpl> Impl_;
 };
 
+template<typename ValueHolder>
 class TValueBuilderImpl;
 
-template<typename TDerived>
+
+class StackAllocatedValueHolder {
+public:
+    Ydb::Value& Value() {
+        return ProtoValue_;
+    }
+
+    Ydb::Value* ValuePtr() {
+        return &ProtoValue_;
+    }
+
+private:
+    Ydb::Value ProtoValue_;
+};
+
+class ArenaAllocatedValueHolder {
+public:
+    ArenaAllocatedValueHolder(google::protobuf::Arena* arena)
+        // value is created lazily on first access
+        : ArenaAllocatedValue_(nullptr)
+        , Arena_(arena) {
+            Y_ASSERT(arena != nullptr);
+        }
+
+    Ydb::Value& Value() {
+        createValueIfAbsent();
+        return *ArenaAllocatedValue_;
+    }
+
+    Ydb::Value* ValuePtr() {
+        createValueIfAbsent();
+        return ArenaAllocatedValue_;
+    }
+
+private:
+    void createValueIfAbsent() {
+        if (ArenaAllocatedValue_ == nullptr) {
+            ArenaAllocatedValue_ = google::protobuf::Arena::CreateMessage<Ydb::Value>(Arena_);
+        }
+    }
+
+private:
+    Ydb::Value* ArenaAllocatedValue_;
+    google::protobuf::Arena* Arena_;
+};
+
+
+
+
+template<typename TDerived, typename ValueHolder>
 class TValueBuilderBase : public TMoveOnly {
     friend TDerived;
 public:
@@ -515,27 +590,34 @@ public:
 protected:
     TValueBuilderBase(TValueBuilderBase&&);
 
-    TValueBuilderBase();
+    TValueBuilderBase(ValueHolder holder);
 
-    TValueBuilderBase(const TType& type);
+    TValueBuilderBase(ValueHolder holder, const TType& type);
 
-    TValueBuilderBase(Ydb::Type& type, Ydb::Value& value);
+    TValueBuilderBase(ValueHolder holder, Ydb::Type& type, Ydb::Value& value);
 
     ~TValueBuilderBase();
 
     void CheckValue();
 
 private:
-    std::unique_ptr<TValueBuilderImpl> Impl_;
+    std::unique_ptr<TValueBuilderImpl<ValueHolder>> Impl_;
 };
 
-class TValueBuilder : public TValueBuilderBase<TValueBuilder> {
+class TValueBuilder : public TValueBuilderBase<TValueBuilder, StackAllocatedValueHolder> {
 public:
     TValueBuilder();
 
     TValueBuilder(const TType& type);
 
     TValue Build();
+};
+
+class TArenaAllocatedValueBuilder : public TValueBuilderBase<TArenaAllocatedValueBuilder, ArenaAllocatedValueHolder> {
+public:
+    TArenaAllocatedValueBuilder(google::protobuf::Arena* arena);
+
+    TArenaAllocatedValue BuildArenaAllocatedValue();
 };
 
 } // namespace NYdb

@@ -11,6 +11,8 @@
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/scheme/scheme.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/table/table.h>
 
+#include <google/protobuf/arena.h>
+
 #include <ydb/public/api/protos/ydb_formats.pb.h>
 #include <ydb/public/api/protos/ydb_table.pb.h>
 #include <ydb/public/lib/json_value/ydb_json_value.h>
@@ -50,6 +52,7 @@
 #include <unistd.h>
 #endif
 
+#include <ydb/public/lib/ydb_cli/commands/ydb_command.h>
 
 namespace NYdb {
 namespace NConsoleClient {
@@ -557,6 +560,10 @@ private:
                               std::shared_ptr<TProgressFile> progressFile);
     TAsyncStatus UpsertTValueBuffer(const TString& dbPath, TValueBuilder& builder);
     TAsyncStatus UpsertTValueBuffer(const TString& dbPath, std::function<TValue()>&& buildFunc);
+
+    TAsyncStatus UpsertTValueBufferOnArena(
+        const TString& dbPath, std::function<TArenaAllocatedValue(google::protobuf::Arena*)>&& buildFunc);
+
     TStatus UpsertJson(IInputStream &input, const TString &dbPath, std::optional<ui64> inputSizeHint,
                        ProgressCallbackFunc & progressCallback);
     TStatus UpsertParquet(const TString& filename, const TString& dbPath, ProgressCallbackFunc & progressCallback);
@@ -682,7 +689,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
     auto start = TInstant::Now();
 
 
-    TThreadPool jobPool;
+    TThreadPool jobPool(IThreadPool::TParams().SetThreadNamePrefix("FileWorker"));
     jobPool.Start(filePathsSize);
     TVector<NThreading::TFuture<TStatus>> asyncResults;
 
@@ -702,6 +709,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
     for (size_t fileOrderNumber = 0; fileOrderNumber < filePathsSize; ++fileOrderNumber) {
         const auto& filePath = filePaths[fileOrderNumber];
         std::shared_ptr<TProgressFile> progressFile = LoadOrStartImportProgress(filePath);
+
         auto func = [&, fileOrderNumber, progressFile, this] {
             std::unique_ptr<TFileInput> fileInput;
             std::optional<ui64> fileSizeHint;
@@ -963,6 +971,7 @@ inline
 TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath, std::function<TValue()>&& buildFunc) {
     // For the first attempt values are built before acquiring request inflight semaphore
     std::optional<TValue> prebuiltValue = buildFunc();
+
     auto retryFunc = [this, &dbPath, buildFunc = std::move(buildFunc), prebuiltValue = std::move(prebuiltValue)]
             (NYdb::NTable::TTableClient& tableClient) mutable -> TAsyncStatus {
         auto buildTValueAndSendRequest = [this, &buildFunc, &dbPath, &tableClient, &prebuiltValue]() {
@@ -970,7 +979,7 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
             // to prevent copying data in retryFunc in a happy way when there is only one request
             TValue builtValue = prebuiltValue.has_value() ? std::move(prebuiltValue.value()) : buildFunc();
             prebuiltValue = std::nullopt;
-            return tableClient.BulkUpsert(dbPath, std::move(builtValue), UpsertSettings)
+            return tableClient.BulkUpsertUnretryable(dbPath, std::move(builtValue), UpsertSettings)
                 .Apply([](const NYdb::NTable::TAsyncBulkUpsertResult& bulkUpsertResult) {
                     NYdb::TStatus status = bulkUpsertResult.GetValueSync();
                     return NThreading::MakeFuture(status);
@@ -1002,6 +1011,87 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
             return asyncStatus;
         });
 }
+
+
+
+
+
+inline
+TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferOnArena(
+    const TString& dbPath, std::function<TArenaAllocatedValue(google::protobuf::Arena*)>&& buildFunc) {
+    auto retryFunc = [this, &dbPath, buildFunc = std::move(buildFunc)]
+            (NYdb::NTable::TTableClient& tableClient) mutable -> TAsyncStatus {
+        auto buildTValueAndSendRequest = [this, &buildFunc, &dbPath, &tableClient]() {
+            // static thread_local std::shared_ptr<google::protobuf::Arena> thread_arena = std::make_shared<google::protobuf::Arena>();
+            static thread_local google::protobuf::Arena thread_arena;
+
+            // static thread_local bool printed = false;
+            // static thread_local ui64 print_cnt = 0;
+            // static thread_local ui64 print_reset_cnt = 0;
+            // if (!printed) {
+            //     std::cerr << "Arena " << thread_arena.get()
+            //          << " created by thread " << std::this_thread::get_id() << std::endl;
+            //     printed = true;
+            // }
+
+            // if (print_cnt % 100 == 0) {
+            //     std::cerr << "Arena " << thread_arena.get()
+            //          << " used " << PrettifyBytes(thread_arena->SpaceUsed()) << " bytes "
+            //          << " on thread " << std::this_thread::get_id() << std::endl;
+            // }
+
+            if (thread_arena.SpaceUsed() > Settings.ArenaSizeThreshold_) {
+                // if (print_reset_cnt % 100 == 0) {
+                //     std::cerr << "Reset arena " << thread_arena.get()
+                //         << " used " << PrettifyBytes(thread_arena->SpaceUsed()) << " bytes "
+                //          << " on thread " << std::this_thread::get_id() << std::endl;
+                // }
+                // arena = std::make_shared<google::protobuf::Arena>();
+                thread_arena.Reset();
+                //++print_reset_cnt;
+            }
+            // ++print_cnt;
+
+            TArenaAllocatedValue builtValue = buildFunc(&thread_arena);
+
+            return tableClient.BulkUpsertUnretryableArenaAllocated(
+                dbPath, std::move(builtValue), &thread_arena, UpsertSettings)
+                .Apply([](const NYdb::NTable::TAsyncBulkUpsertResult& bulkUpsertResult) {
+                    NYdb::TStatus status = bulkUpsertResult.GetValueSync();
+                    return NThreading::MakeFuture(status);
+                });
+        };
+        // Running heavy building task on processing pool:
+        return NThreading::Async(std::move(buildTValueAndSendRequest), *ProcessingPool);
+    };
+    if (!RequestsInflight->try_acquire()) {
+        if (Settings.Verbose_ && Settings.NewlineDelimited_) {
+            if (!InformedAboutLimit.exchange(true)) {
+                Cerr << (TStringBuilder() << "@ (each '@' means max request inflight is reached and a worker thread is waiting for "
+                "any response from database)" << Endl);
+            } else {
+                Cerr << '@';
+            }
+        }
+        RequestsInflight->acquire();
+    }
+    return TableClient->RetryOperation(std::move(retryFunc), RetrySettings)
+        .Apply([this](const TAsyncStatus& asyncStatus) {
+            NYdb::TStatus status = asyncStatus.GetValueSync();
+            if (!status.IsSuccess()) {
+                if (!Failed.exchange(true)) {
+                    ErrorStatus = MakeHolder<TStatus>(status);
+                }
+            }
+            RequestsInflight->release();
+            return asyncStatus;
+        });
+}
+
+
+
+
+
 
 TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
                                      const TString& dbPath,
@@ -1065,9 +1155,21 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     };
 
     auto upsertCsvFunc = [&](std::vector<TString>&& buffer, ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) {
-        auto buildFunc = [&, buffer = std::move(buffer), row, this] () mutable {
+        // auto buildFunc = [&, buffer = std::move(buffer), row, this] () mutable {
+        //     try {
+        //         return parser.BuildList(buffer, filePath, row);
+        //     } catch (const std::exception& e) {
+        //         if (!Failed.exchange(true)) {
+        //             ErrorStatus = MakeHolder<TStatus>(MakeStatus(EStatus::INTERNAL_ERROR, e.what()));
+        //         }
+        //         jobInflightManager->ReleaseJob();
+        //         throw;
+        //     }
+        // };
+
+        auto buildOnArenaFunc = [&, buffer = std::move(buffer), row, this] (google::protobuf::Arena* arena) mutable {
             try {
-                return parser.BuildList(buffer, filePath, row);
+                return parser.BuildListOnArena(buffer, filePath, arena, row);
             } catch (const std::exception& e) {
                 if (!Failed.exchange(true)) {
                     ErrorStatus = MakeHolder<TStatus>(MakeStatus(EStatus::INTERNAL_ERROR, e.what()));
@@ -1076,7 +1178,10 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
                 throw;
             }
         };
-        UpsertTValueBuffer(dbPath, std::move(buildFunc))
+
+        // TODO: create arena here and pass it to UpsertTValueBufferOnArena?
+        // UpsertTValueBuffer(dbPath, std::move(buildFunc))
+        UpsertTValueBufferOnArena(dbPath, std::move(buildOnArenaFunc))
             .Apply([&, batchStatus](const TAsyncStatus& asyncStatus) {
                 jobInflightManager->ReleaseJob();
                 if (asyncStatus.GetValueSync().IsSuccess()) {
@@ -1115,7 +1220,7 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             line.erase(line.size() - Settings.Delimiter_.size());
         }
 
-        buffer.push_back(line);
+        buffer.push_back(std::move(line));
 
         if (readBytes >= nextReadBorder && Settings.Verbose_) {
             nextReadBorder += VerboseModeStepSize;
