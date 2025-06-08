@@ -989,6 +989,76 @@ void TTableClient::TImpl::SetStatCollector(const NSdkStats::TStatCollector::TCli
     SessionRemovedDueBalancing.Set(collector.SessionRemovedDueBalancing);
 }
 
+TAsyncBulkUpsertResult TTableClient::TImpl::BulkUpsertUnretryable(const std::string& table, TValue&& rows, const TBulkUpsertSettings& settings) {
+    auto request = MakeOperationRequest<Ydb::Table::BulkUpsertRequest>(settings);
+    request.set_table(TStringType{table});
+    *request.mutable_rows()->mutable_type() = std::move(rows.GetType()).ExtractProto();
+    *request.mutable_rows()->mutable_value() = std::move(rows).ExtractProto();
+
+    auto promise = NewPromise<TBulkUpsertResult>();
+
+    auto extractor = [promise]
+        (google::protobuf::Any* any, TPlainStatus status) mutable {
+            Y_UNUSED(any);
+            TBulkUpsertResult val(TStatus(std::move(status)));
+            promise.SetValue(std::move(val));
+        };
+
+    Connections_->RunDeferred<Ydb::Table::V1::TableService, Ydb::Table::BulkUpsertRequest, Ydb::Table::BulkUpsertResponse>(
+        std::move(request),
+        extractor,
+        &Ydb::Table::V1::TableService::Stub::AsyncBulkUpsert,
+        DbDriverState_,
+        INITIAL_DEFERRED_CALL_DELAY,
+        TRpcRequestSettings::Make(settings));
+
+    return promise.GetFuture();
+}
+
+
+TAsyncBulkUpsertResult TTableClient::TImpl::BulkUpsertUnretryableArenaAllocated(
+    const std::string& table,
+    TArenaAllocatedValue&& rows,
+    google::protobuf::Arena* arena,
+    const TBulkUpsertSettings& settings
+) {
+    auto request = MakeOperationRequestOnArena<Ydb::Table::BulkUpsertRequest>(settings, arena);
+    // std::cout << "request->GetArena(): " << request->GetArena() << "\n"
+    //           << "request->mutable_rows()->GetArena(): " << request->mutable_rows()->GetArena() << "\n"
+    //           << "Value->GetArena(): " << rows.second->GetArena() << "\n"
+    //           << "given arena: " << arena << std::endl;
+    // assert(request->GetArena() == arena);
+    // assert(request->mutable_rows()->GetArena() == arena);
+    request->set_table(TStringType{table});
+    // TODO: Ydb::Type still gets copied because request is arena-allocated and rows' Type is not
+    *request->mutable_rows()->mutable_type() = std::move(rows.GetType()).ExtractProto();
+    *request->mutable_rows()->mutable_value() = std::move(rows).ExtractProto();
+
+    auto promise = NewPromise<TBulkUpsertResult>();
+
+    auto extractor = [promise]
+        (google::protobuf::Any* any, TPlainStatus status) mutable {
+            Y_UNUSED(any);
+            TBulkUpsertResult val(TStatus(std::move(status)));
+            promise.SetValue(std::move(val));
+        };
+
+    // TODO: make sure it is correct; see what server receives
+    // don't give ownership of request to the function
+    Connections_->RunDeferredOnArena<Ydb::Table::V1::TableService, Ydb::Table::BulkUpsertRequest, Ydb::Table::BulkUpsertResponse>(
+        request,
+        extractor,
+        &Ydb::Table::V1::TableService::Stub::AsyncBulkUpsert,
+        DbDriverState_,
+        INITIAL_DEFERRED_CALL_DELAY,
+        TRpcRequestSettings::Make(settings));
+
+    return promise.GetFuture();
+}
+
+
+
+
 TAsyncBulkUpsertResult TTableClient::TImpl::BulkUpsert(const std::string& table, TValue&& rows, const TBulkUpsertSettings& settings) {
     auto request = MakeOperationRequest<Ydb::Table::BulkUpsertRequest>(settings);
     request.set_table(TStringType{table});
@@ -1014,6 +1084,7 @@ TAsyncBulkUpsertResult TTableClient::TImpl::BulkUpsert(const std::string& table,
 
     return promise.GetFuture();
 }
+
 
 TAsyncBulkUpsertResult TTableClient::TImpl::BulkUpsert(const std::string& table, EDataFormat format,
     const std::string& data, const std::string& schema, const TBulkUpsertSettings& settings)

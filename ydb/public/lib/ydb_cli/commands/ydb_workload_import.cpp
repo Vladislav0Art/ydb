@@ -131,14 +131,17 @@ public:
 private:
     TAsyncStatus WriteCsv(NYdbWorkload::IBulkDataGenerator::TDataPortionPtr portion) {
         const auto* value = std::get_if<NYdbWorkload::IBulkDataGenerator::TDataPortion::TCsv>(&portion->MutableData());
+        //! GetCSVParams
         const auto param = GetCSVParams(portion->GetTable());
         if (!param.Status.IsSuccess()) {
             return NThreading::MakeFuture(param.Status);
         }
+        //! NKikimr::NFormats::TArrowCSVTable::Create
         auto arrowCsv = NKikimr::NFormats::TArrowCSVTable::Create(param.Columns, true);
         if (!arrowCsv.ok()) {
             return NThreading::MakeFuture(TStatus(EStatus::INTERNAL_ERROR, NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(arrowCsv.status().ToString())})));
         }
+        //! Continue here [stopped here at 27.05.2025, see import.cpp]
         Ydb::Formats::CsvSettings csvSettings;
         if (!csvSettings.ParseFromString(value->FormatString)) {
             return NThreading::MakeFuture(TStatus(EStatus::INTERNAL_ERROR, NYdb::NIssue::TIssues({NYdb::NIssue::TIssue("Invalid format string")})));
@@ -148,6 +151,7 @@ private:
         constexpr auto codecType = arrow::Compression::type::ZSTD;
         writeOptions.codec = *arrow::util::Codec::Create(codecType);
         TString error;
+        // TODO: ask what format value->Data has; ask for a sample
         if (auto batch = arrowCsv->ReadSingleBatch(value->Data, csvSettings, error)) {
             if (error) {
                 return NThreading::MakeFuture(TStatus(EStatus::INTERNAL_ERROR, NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(error)})));
@@ -160,6 +164,7 @@ private:
                     .Apply(ConvertResult);
             }, RetrySettings);
         }
+        //!
         if (error) {
             return NThreading::MakeFuture(TStatus(EStatus::INTERNAL_ERROR, NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(error)})));
         }

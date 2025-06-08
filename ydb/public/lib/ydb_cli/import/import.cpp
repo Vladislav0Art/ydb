@@ -11,6 +11,8 @@
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/scheme/scheme.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/table/table.h>
 
+#include <google/protobuf/arena.h>
+
 #include <ydb/public/api/protos/ydb_formats.pb.h>
 #include <ydb/public/api/protos/ydb_table.pb.h>
 #include <ydb/public/lib/json_value/ydb_json_value.h>
@@ -25,6 +27,7 @@
 #include <library/cpp/string_utils/csv/csv.h>
 #include <library/cpp/threading/future/async.h>
 #include <library/cpp/yaml/as/tstring.h>
+#include <ydb/library/formats/arrow/csv/table/table.h>
 
 #include <util/folder/path.h>
 #include <util/generic/vector.h>
@@ -50,6 +53,7 @@
 #include <unistd.h>
 #endif
 
+#include <ydb/public/lib/ydb_cli/commands/ydb_command.h>
 
 namespace NYdb {
 namespace NConsoleClient {
@@ -557,6 +561,17 @@ private:
                               std::shared_ptr<TProgressFile> progressFile);
     TAsyncStatus UpsertTValueBuffer(const TString& dbPath, TValueBuilder& builder);
     TAsyncStatus UpsertTValueBuffer(const TString& dbPath, std::function<TValue()>&& buildFunc);
+
+
+    TAsyncStatus UpsertTValueBufferParquet(
+        const TString& dbPath,
+        TStringBuilder&& data,
+        const Ydb::Formats::CsvSettings& csvSettings,
+        const arrow::ipc::IpcWriteOptions& writeOptions,
+        const std::vector<NYdb::NTable::TTableColumn>& columns
+    );
+
+
     TStatus UpsertJson(IInputStream &input, const TString &dbPath, std::optional<ui64> inputSizeHint,
                        ProgressCallbackFunc & progressCallback);
     TStatus UpsertParquet(const TString& filename, const TString& dbPath, ProgressCallbackFunc & progressCallback);
@@ -673,7 +688,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
 
     TProgressBar progressBar(100);
 
-    auto writeProgress = [&]() {
+    [[maybe_unused]] auto writeProgress = [&]() {
         ui64 globalProgressValue = globalProgress.load();
         std::lock_guard<std::mutex> lock(progressWriteLock);
         progressBar.SetProcess(globalProgressValue / filePathsSize);
@@ -682,7 +697,8 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
     auto start = TInstant::Now();
 
 
-    TThreadPool jobPool;
+
+    TThreadPool jobPool(IThreadPool::TParams().SetThreadNamePrefix("FileWorker"));
     jobPool.Start(filePathsSize);
     TVector<NThreading::TFuture<TStatus>> asyncResults;
 
@@ -702,6 +718,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
     for (size_t fileOrderNumber = 0; fileOrderNumber < filePathsSize; ++fileOrderNumber) {
         const auto& filePath = filePaths[fileOrderNumber];
         std::shared_ptr<TProgressFile> progressFile = LoadOrStartImportProgress(filePath);
+
         auto func = [&, fileOrderNumber, progressFile, this] {
             std::unique_ptr<TFileInput> fileInput;
             std::optional<ui64> fileSizeHint;
@@ -756,7 +773,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
                     if (progressDiff > 0) {
                         globalProgress.fetch_add(progressDiff);
                         oldProgress = progress;
-                        writeProgress();
+                        // writeProgress();
                     }
                 };
             }
@@ -842,11 +859,20 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
 
     auto finish = TInstant::Now();
     auto duration = finish - start;
-    progressBar.SetProcess(100);
+    // progressBar.SetProcess(100);
     if (duration.SecondsFloat() > 0) {
         std::cerr << "Elapsed: " << std::setprecision(3) << duration.SecondsFloat() << " sec. Total read size: "
             << PrettifyBytes(TotalBytesRead) << ". Average processing speed: "
             << PrettifyBytes((double)TotalBytesRead / duration.SecondsFloat())  << "/s." << std::endl;
+
+        // print strcture for the pipeline:
+        //    elapsed_time_sec: [float]
+        //    total_read_size_byte: [integer]
+        //    avg_processing_speed_bytes_per_sec: [integer]
+        std::cout << "elapsed_time_sec: " << std::setprecision(5) << duration.SecondsFloat() << std::endl;
+        std::cout << "total_read_size_byte: " << TotalBytesRead << std::endl;
+        std::cout << "avg_processing_speed_MiB_per_sec: " << std::setprecision(5)
+                  << ((double)TotalBytesRead / duration.SecondsFloat()) / (1024 * 1024) << std::endl;
     }
 
     // Removing all progress files that were a part of this import
@@ -856,6 +882,7 @@ TStatus TImportFileClient::TImpl::Import(const TVector<TString>& filePaths, cons
 
     return MakeStatus(EStatus::SUCCESS);
 }
+
 
 std::shared_ptr<TProgressFile> TImportFileClient::TImpl::LoadOrStartImportProgress(const TString& filePath) {
     std::shared_ptr<TProgressFile> progressFile;
@@ -963,6 +990,7 @@ inline
 TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath, std::function<TValue()>&& buildFunc) {
     // For the first attempt values are built before acquiring request inflight semaphore
     std::optional<TValue> prebuiltValue = buildFunc();
+
     auto retryFunc = [this, &dbPath, buildFunc = std::move(buildFunc), prebuiltValue = std::move(prebuiltValue)]
             (NYdb::NTable::TTableClient& tableClient) mutable -> TAsyncStatus {
         auto buildTValueAndSendRequest = [this, &buildFunc, &dbPath, &tableClient, &prebuiltValue]() {
@@ -970,7 +998,7 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
             // to prevent copying data in retryFunc in a happy way when there is only one request
             TValue builtValue = prebuiltValue.has_value() ? std::move(prebuiltValue.value()) : buildFunc();
             prebuiltValue = std::nullopt;
-            return tableClient.BulkUpsert(dbPath, std::move(builtValue), UpsertSettings)
+            return tableClient.BulkUpsertUnretryable(dbPath, std::move(builtValue), UpsertSettings)
                 .Apply([](const NYdb::NTable::TAsyncBulkUpsertResult& bulkUpsertResult) {
                     NYdb::TStatus status = bulkUpsertResult.GetValueSync();
                     return NThreading::MakeFuture(status);
@@ -1003,6 +1031,82 @@ TAsyncStatus TImportFileClient::TImpl::UpsertTValueBuffer(const TString& dbPath,
         });
 }
 
+
+inline
+TAsyncStatus TImportFileClient::TImpl::UpsertTValueBufferParquet(
+    const TString& dbPath,
+    TStringBuilder&& data,
+    const Ydb::Formats::CsvSettings& csvSettings,
+    const arrow::ipc::IpcWriteOptions& writeOptions,
+    const std::vector<NYdb::NTable::TTableColumn>& columns
+) {
+    //!
+    // TODO: `TzDatetime` type is not supported in table columns (https://ydb.tech/docs/en/yql/reference/types/primitive)
+    // TODO: thus, `TArrowCSVTable::Create` will fail. We can make a fallback on the arena-based solution.
+    // if header is present, it is expected to be the first line of the data
+    auto arrowCsv = NKikimr::NFormats::TArrowCSVTable::Create(columns, Settings.Header_);
+    if (!arrowCsv.ok()) {
+        std::cerr << "Could not create arrow csv table: " << arrowCsv.status().ToString() << std::endl;
+        return NThreading::MakeFuture(
+            TStatus(
+                EStatus::INTERNAL_ERROR,
+                NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(arrowCsv.status().ToString())})
+            )
+        );
+    }
+
+    TString error;
+    if (auto batch = arrowCsv->ReadSingleBatch(data, csvSettings, error)) {
+        if (error) {
+            //! TODO: what to do here?
+            return NThreading::MakeFuture(
+                TStatus(EStatus::INTERNAL_ERROR, NYdb::NIssue::TIssues({NYdb::NIssue::TIssue(error)}))
+            );
+        }
+
+        if (!RequestsInflight->try_acquire()) {
+            if (Settings.Verbose_ && Settings.NewlineDelimited_) {
+                if (!InformedAboutLimit.exchange(true)) {
+                    Cerr << (TStringBuilder() << "@ (each '@' means max request inflight is reached and a worker thread is waiting for "
+                    "any response from database)" << Endl);
+                } else {
+                    Cerr << '@';
+                }
+            }
+            RequestsInflight->acquire();
+        }
+
+        auto retryFunc = [parquet = NYdb_cli::NArrow::SerializeBatch(batch, writeOptions),
+                schema = NYdb_cli::NArrow::SerializeSchema(*batch->schema()),
+                dbPath](NTable::TTableClient& client) {
+            return client.BulkUpsert(dbPath, NTable::EDataFormat::ApacheArrow, parquet, schema)
+                .Apply([](const NTable::TAsyncBulkUpsertResult& result) {
+                    return TStatus(result.GetValueSync());
+                });
+        };
+
+        return TableClient->RetryOperation(std::move(retryFunc), RetrySettings)
+            .Apply([this](const TAsyncStatus& asyncStatus) {
+                NYdb::TStatus status = asyncStatus.GetValueSync();
+                if (!status.IsSuccess()) {
+                    if (!Failed.exchange(true)) {
+                        ErrorStatus = MakeHolder<TStatus>(status);
+                    }
+                }
+                RequestsInflight->release();
+                return asyncStatus;
+            });
+    }
+    else {
+        std::cerr << "[UpsertTValueBufferParquet] error: " << error << std::endl;
+        return NThreading::MakeFuture(
+            TStatus(EStatus::INTERNAL_ERROR, NYdb::NIssue::TIssues({NYdb::NIssue::TIssue("Could not create batch")}))
+        );
+    }
+}
+
+
+
 TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
                                      const TString& dbPath,
                                      const TString& filePath,
@@ -1030,6 +1134,11 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     ui64 nextReadBorder = VerboseModeStepSize;
     ui64 skippedBytes = 0;
     ui64 nextSkipBorder = VerboseModeStepSize;
+
+    std::cerr << "Settings.Header_: " << Settings.Header_ << std::endl;
+    std::cerr << "Settings.SkipRows_: " << Settings.SkipRows_ << std::endl;
+    std::cerr << "rowsToSkip: " << rowsToSkip << std::endl;
+    std::cerr << "row: " << row << std::endl;
 
     TString line;
     std::vector<TAsyncStatus> inFlightRequests;
@@ -1064,19 +1173,44 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
         }
     };
 
-    auto upsertCsvFunc = [&](std::vector<TString>&& buffer, ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) {
-        auto buildFunc = [&, buffer = std::move(buffer), row, this] () mutable {
-            try {
-                return parser.BuildList(buffer, filePath, row);
-            } catch (const std::exception& e) {
-                if (!Failed.exchange(true)) {
-                    ErrorStatus = MakeHolder<TStatus>(MakeStatus(EStatus::INTERNAL_ERROR, e.what()));
-                }
-                jobInflightManager->ReleaseJob();
-                throw;
-            }
-        };
-        UpsertTValueBuffer(dbPath, std::move(buildFunc))
+
+    //!
+    // table = dbPath (path to the table on the server)
+    auto columns = DbTableInfo->GetTableColumns();
+
+    std::cerr << "columns: " << columns.size() << std::endl;
+    for (const auto& column : columns) {
+        std::cerr << "column: " << column.Name << " " << column.Type.ToString() << std::endl;
+    }
+
+    const Ydb::Formats::CsvSettings csvSettings = ([this]() {
+        Ydb::Formats::CsvSettings settings;
+        settings.set_delimiter(Settings.Delimiter_);
+        settings.set_header(Settings.Header_);
+        if (Settings.NullValue_.has_value()) {
+            settings.set_null_value(Settings.NullValue_.value());
+        }
+        settings.set_skip_rows(Settings.SkipRows_);
+        return settings;
+    }());
+
+    auto writeOptions = arrow::ipc::IpcWriteOptions::Defaults();
+    constexpr auto codecType = arrow::Compression::type::UNCOMPRESSED; // ZSTD
+    writeOptions.codec = *arrow::util::Codec::Create(codecType);
+    //!
+
+    auto upsertCsvFunc = [&](std::vector<TString>&& buffer, [[maybe_unused]] ui64 row, std::shared_ptr<TImportBatchStatus> batchStatus) -> NThreading::TFuture<NYdb::TStatus> {
+        //!
+        const i64 estimatedCsvLineLength = (!buffer.empty() ? 2 * buffer.front().size() : 10'000);
+        TStringBuilder data;
+        data.reserve((buffer.size() + (Settings.Header_ ? 1 : 0)) * estimatedCsvLineLength);
+        // insert header if it is present in the given csv file
+        if (Settings.Header_) {
+            data << parser.GetHeaderRow() << Endl;
+        }
+        data << JoinSeq("\n", buffer) << Endl;
+
+        return UpsertTValueBufferParquet(dbPath, std::move(data), csvSettings, writeOptions, columns)
             .Apply([&, batchStatus](const TAsyncStatus& asyncStatus) {
                 jobInflightManager->ReleaseJob();
                 if (asyncStatus.GetValueSync().IsSuccess()) {
@@ -1088,6 +1222,7 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
                 }
                 return asyncStatus;
             });
+        //!
     };
 
     for (ui32 i = 0; i < rowsToSkip; ++i) {
@@ -1098,6 +1233,37 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             nextSkipBorder += VerboseModeStepSize;
         }
     }
+
+
+
+    const ui64 samplingInterval_ms = 1000;
+    const TInstant samplingStartTime = TInstant::Now();
+    ui64 bytesUploadedTotal = 0;
+    ui64 bytesUploadedOnLastSample = 0;
+    TInstant lastSampleTime = TInstant::Zero();
+    std::mutex samplingMutex;
+
+    auto doSampling = [&bytesUploadedTotal, &bytesUploadedOnLastSample, &lastSampleTime, &samplingMutex, &samplingStartTime](ui64 batchBytes) {
+        auto currentTime = TInstant::Now();
+        std::lock_guard<std::mutex> lock(samplingMutex);
+
+        bytesUploadedTotal += batchBytes;
+
+        auto timeDiff = currentTime - lastSampleTime;
+        if (timeDiff.MilliSeconds() > samplingInterval_ms) {
+            // do sampling
+            ui64 bytesUploadedSinceLastSample = bytesUploadedTotal - bytesUploadedOnLastSample;
+
+            auto uploadSpeedMiBPerSec = static_cast<double>(bytesUploadedSinceLastSample) / timeDiff.SecondsFloat() / (1024 * 1024);
+            std::cout << "[sample]: "
+                      << "timeElapsedSec: " << (currentTime - samplingStartTime).SecondsFloat() << " s "
+                      << "uploadSpeedMiBPerSec: " << std::setprecision(5) << uploadSpeedMiBPerSec << " MiB/s" << std::endl;
+
+            lastSampleTime = currentTime;
+            bytesUploadedOnLastSample = bytesUploadedTotal;
+        }
+    };
+
 
     while (TString line = splitter.ConsumeLine()) {
         ++batchRows;
@@ -1115,7 +1281,7 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             line.erase(line.size() - Settings.Delimiter_.size());
         }
 
-        buffer.push_back(line);
+        buffer.push_back(std::move(line));
 
         if (readBytes >= nextReadBorder && Settings.Verbose_) {
             nextReadBorder += VerboseModeStepSize;
@@ -1130,9 +1296,12 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
             progressCallback(skippedBytes + readBytes, *inputSizeHint);
         }
 
-        auto workerFunc = [&upsertCsvFunc, row, buffer = std::move(buffer),
+        auto workerFunc = [&doSampling, &upsertCsvFunc, batchBytes, row, buffer = std::move(buffer),
                 batchStatus = createStatus(row + batchRows)]() mutable {
-            upsertCsvFunc(std::move(buffer), row, batchStatus);
+            upsertCsvFunc(std::move(buffer), row, batchStatus)
+                .Subscribe([&doSampling, batchBytes](const NThreading::TFuture<NYdb::TStatus>&) {
+                    doSampling(batchBytes);
+                });
         };
         row += batchRows;
         batchRows = 0;
@@ -1153,7 +1322,10 @@ TStatus TImportFileClient::TImpl::UpsertCsv(IInputStream& input,
     // Send the rest if buffer is not empty
     if (!buffer.empty() && countInput.Counter() > 0 && !Failed) {
         jobInflightManager->AcquireJob();
-        upsertCsvFunc(std::move(buffer), row, createStatus(row + batchRows));
+        upsertCsvFunc(std::move(buffer), row, createStatus(row + batchRows))
+            .Subscribe([&doSampling, batchBytes](const NThreading::TFuture<NYdb::TStatus>&) {
+                doSampling(batchBytes);
+            });
     }
 
     jobInflightManager->WaitForAllJobs();
